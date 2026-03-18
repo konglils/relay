@@ -5,9 +5,11 @@ use std::path::{Component, Path, PathBuf};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{Request, StatusCode};
+use axum::http::{header, Request, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
+use bytes::Bytes;
+use futures_util::stream::Stream;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
@@ -48,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/", get(handle_root))
         .route("/{*path}", get(handle_path))
+        .route("/__speedtest", get(handle_speedtest))
         .with_state(state);
 
     println!("Serving on http://{}", addr);
@@ -107,6 +110,32 @@ async fn handle_path_impl(
         match service.oneshot(req).await {
             Ok(response) => Ok(response.into_response()),
             Err(_) => Err(server_error()),
+        }
+    }
+}
+
+async fn handle_speedtest() -> Response {
+    let stream = speedtest_stream();
+    let body = Body::from_stream(stream);
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store, no-cache, must-revalidate, max-age=0"),
+    );
+    response
+}
+
+fn speedtest_stream() -> impl Stream<Item = Result<Bytes, std::io::Error>> {
+    async_stream::stream! {
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            fastrand::fill(&mut buffer);
+            yield Ok(Bytes::copy_from_slice(&buffer));
+            tokio::task::yield_now().await;
         }
     }
 }
@@ -185,7 +214,27 @@ async fn render_directory_listing(root: &Path, relative: &Path) -> Result<String
         html.push_str("</a></li>");
     }
 
-    html.push_str("</ul></body></html>");
+    html.push_str("</ul>");
+    html.push_str("<button id=\"speedtest\" style=\"position:fixed;right:20px;bottom:20px;padding:10px 16px\">测速</button>");
+    html.push_str("<script>");
+    html.push_str("const btn=document.getElementById('speedtest');");
+    html.push_str("btn.addEventListener('click',async()=>{");
+    html.push_str("btn.disabled=true;const original=btn.textContent;btn.textContent='测速中';");
+    html.push_str("const start=performance.now();let received=0;");
+    html.push_str("const controller=new AbortController();");
+    html.push_str("setTimeout(()=>controller.abort(),10000);");
+    html.push_str("try{");
+    html.push_str("const res=await fetch('/__speedtest',{signal:controller.signal,cache:'no-store'});");
+    html.push_str("const reader=res.body.getReader();");
+    html.push_str("while(true){const {done,value}=await reader.read();if(done)break;received+=value.byteLength;}");
+    html.push_str("}catch(e){}");
+    html.push_str("const end=performance.now();const seconds=(end-start)/1000;");
+    html.push_str("const mbps=(received*8)/(seconds*1000*1000);");
+    html.push_str("alert(`接收 ${received} 字节，耗时 ${seconds.toFixed(2)} 秒，速度约 ${mbps.toFixed(2)} Mbps`);");
+    html.push_str("btn.textContent=original;btn.disabled=false;");
+    html.push_str("});");
+    html.push_str("</script>");
+    html.push_str("</body></html>");
     Ok(html)
 }
 
