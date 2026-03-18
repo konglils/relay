@@ -79,6 +79,7 @@ dependencies = [
  "axum",
  "bytes",
  "tokio",
+ "tower",
  "tower-http",
 ]
 
