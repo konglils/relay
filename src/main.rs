@@ -359,10 +359,10 @@ fn render_sections(
 fn render_vars(template: &str, vars: &HashMap<&'static str, String>) -> String {
     let mut output = template.to_string();
     for (key, value) in vars {
-        let token = format!("{{{{{key}}}}}");
-        output = output.replace(&token, &escape_html(value));
         let raw_token = format!("{{{{{{{key}}}}}}}");
         output = output.replace(&raw_token, value);
+        let token = format!("{{{{{key}}}}}");
+        output = output.replace(&token, &escape_html(value));
     }
     output
 }
