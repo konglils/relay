@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{header, Request, StatusCode};
+use axum::http::{Request, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
@@ -20,10 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(value) => value,
         None => return usage("missing port argument"),
     };
-    let root_arg = match args.next() {
-        Some(value) => value,
-        None => return usage("missing root path argument"),
-    };
+    let root_arg = args.next();
     if args.next().is_some() {
         return usage("too many arguments");
     }
@@ -32,20 +29,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(value) => value,
         Err(_) => return usage("invalid port"),
     };
-    let root = PathBuf::from(root_arg);
-    let metadata = match std::fs::metadata(&root) {
-        Ok(value) => value,
-        Err(_) => return usage("root path does not exist or is not accessible"),
-    };
-    if !metadata.is_dir() {
-        return usage("root path is not a directory");
-    }
-    let root = match root.canonicalize() {
-        Ok(value) => value,
-        Err(_) => return usage("failed to canonicalize root path"),
+    let root = match root_arg {
+        Some(value) => {
+            let root = PathBuf::from(value);
+            let metadata = match std::fs::metadata(&root) {
+                Ok(value) => value,
+                Err(_) => return usage("root path does not exist or is not accessible"),
+            };
+            if !metadata.is_dir() {
+                return usage("root path is not a directory");
+            }
+            match root.canonicalize() {
+                Ok(value) => Some(value),
+                Err(_) => return usage("failed to canonicalize root path"),
+            }
+        }
+        None => None,
     };
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr: SocketAddr = format!("[::]:{}", port).parse()?;
     let state = AppState { root };
     let app = Router::new()
         .route("/", get(handle_root))
@@ -62,19 +64,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn usage(message: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Error: {message}");
-    eprintln!("Usage: file-share <port> <root_path>");
+    eprintln!("Usage: file-share <port> [root_path]");
     Err("invalid arguments".into())
 }
 
 #[derive(Clone)]
 struct AppState {
-    root: PathBuf,
+    root: Option<PathBuf>,
 }
 
 async fn handle_root(
     State(state): State<AppState>,
     req: Request<Body>,
 ) -> Result<Response, Response> {
+    if state.root.is_none() {
+        let html = render_speedtest_only();
+        return Ok(Html(html).into_response());
+    }
     handle_path_impl(state, "".to_string(), req).await
 }
 
@@ -91,8 +97,11 @@ async fn handle_path_impl(
     path: String,
     req: Request<Body>,
 ) -> Result<Response, Response> {
+    if state.root.is_none() {
+        return Err(not_found());
+    }
     let relative = sanitize_path(&path).ok_or_else(not_found)?;
-    let full_path = state.root.join(&relative);
+    let full_path = state.root.as_ref().unwrap().join(&relative);
 
     let metadata = match tokio::fs::metadata(&full_path).await {
         Ok(value) => value,
@@ -100,7 +109,7 @@ async fn handle_path_impl(
     };
 
     if metadata.is_dir() {
-        let html = match render_directory_listing(&state.root, &relative).await {
+        let html = match render_directory_listing(state.root.as_ref().unwrap(), &relative).await {
             Ok(value) => value,
             Err(_) => return Err(server_error()),
         };
@@ -215,25 +224,7 @@ async fn render_directory_listing(root: &Path, relative: &Path) -> Result<String
     }
 
     html.push_str("</ul>");
-    html.push_str("<button id=\"speedtest\" style=\"position:fixed;right:20px;bottom:20px;padding:10px 16px\">测速</button>");
-    html.push_str("<script>");
-    html.push_str("const btn=document.getElementById('speedtest');");
-    html.push_str("btn.addEventListener('click',async()=>{");
-    html.push_str("btn.disabled=true;const original=btn.textContent;btn.textContent='测速中';");
-    html.push_str("const start=performance.now();let received=0;");
-    html.push_str("const controller=new AbortController();");
-    html.push_str("setTimeout(()=>controller.abort(),10000);");
-    html.push_str("try{");
-    html.push_str("const res=await fetch('/__speedtest',{signal:controller.signal,cache:'no-store'});");
-    html.push_str("const reader=res.body.getReader();");
-    html.push_str("while(true){const {done,value}=await reader.read();if(done)break;received+=value.byteLength;}");
-    html.push_str("}catch(e){}");
-    html.push_str("const end=performance.now();const seconds=(end-start)/1000;");
-    html.push_str("const mbps=(received*8)/(seconds*1000*1000);");
-    html.push_str("alert(`接收 ${received} 字节，耗时 ${seconds.toFixed(2)} 秒，速度约 ${mbps.toFixed(2)} Mbps`);");
-    html.push_str("btn.textContent=original;btn.disabled=false;");
-    html.push_str("});");
-    html.push_str("</script>");
+    html.push_str(&speedtest_button_html());
     html.push_str("</body></html>");
     Ok(html)
 }
@@ -259,4 +250,42 @@ fn not_found() -> Response {
 
 fn server_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+}
+
+fn speedtest_button_html() -> String {
+    let mut html = String::new();
+    html.push_str("<button id=\"speedtest\" style=\"position:fixed;right:20px;bottom:20px;padding:10px 16px\">测速</button>");
+    html.push_str("<script>");
+    html.push_str("const btn=document.getElementById('speedtest');");
+    html.push_str("btn.addEventListener('click',async()=>{");
+    html.push_str("btn.disabled=true;const original=btn.textContent;btn.textContent='测速中';");
+    html.push_str("const start=performance.now();let received=0;");
+    html.push_str("const controller=new AbortController();");
+    html.push_str("setTimeout(()=>controller.abort(),10000);");
+    html.push_str("try{");
+    html.push_str(
+        "const res=await fetch('/__speedtest',{signal:controller.signal,cache:'no-store'});",
+    );
+    html.push_str("const reader=res.body.getReader();");
+    html.push_str("while(true){const {done,value}=await reader.read();if(done)break;received+=value.byteLength;}");
+    html.push_str("}catch(e){}");
+    html.push_str("const end=performance.now();const seconds=(end-start)/1000;");
+    html.push_str("const mbps=(received*8)/(seconds*1000*1000);");
+    html.push_str("alert(`接收 ${received} 字节，耗时 ${seconds.toFixed(2)} 秒，速度约 ${mbps.toFixed(2)} Mbps`);");
+    html.push_str("btn.textContent=original;btn.disabled=false;");
+    html.push_str("});");
+    html.push_str("</script>");
+    html
+}
+
+fn render_speedtest_only() -> String {
+    let mut html = String::new();
+    html.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
+    html.push_str("<title>Speed Test</title>");
+    html.push_str("<style>body{font-family:system-ui,sans-serif;padding:24px}</style>");
+    html.push_str("</head><body>");
+    html.push_str("<h1>Speed Test</h1>");
+    html.push_str(&speedtest_button_html());
+    html.push_str("</body></html>");
+    html
 }
