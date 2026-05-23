@@ -1,0 +1,80 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{{title}}</title>
+  <style>
+    :root{
+      --primary:oklch(0.684 0.144 155);
+      --bg:oklch(0.985 0.006 155);
+      --surface:oklch(0.998 0.003 155);
+      --text:oklch(0.29 0.02 155);
+      --muted:oklch(0.56 0.02 155);
+      --line:oklch(0.9 0.012 155);
+      --primary-soft:oklch(0.95 0.04 155);
+      --primary-strong:oklch(0.6 0.13 155);
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      background:var(--bg);
+      color:var(--text);
+      font-family:sans-serif;
+      font-size:16px;
+      line-height:1.5;
+    }
+    .wrap{max-width:860px;margin:36px auto 72px;padding:0 20px}
+    h1{margin:0 0 16px;font-size:1.5rem;font-weight:600}
+    .panel{
+      background:var(--surface);
+      border:1px solid var(--line);
+      border-radius:10px;
+      padding:12px 16px;
+    }
+    ul{list-style:none;margin:0;padding:0}
+    li{margin:0}
+    a{
+      display:block;
+      color:var(--text);
+      text-decoration:none;
+      padding:8px 10px;
+      border-radius:8px;
+      transition:background-color .15s,color .15s;
+    }
+    a:hover{background:var(--primary-soft);color:var(--primary-strong)}
+    #speedtest{
+      position:fixed;
+      right:20px;
+      bottom:20px;
+      padding:10px 16px;
+      border:1px solid var(--primary-strong);
+      background:var(--primary);
+      color:oklch(0.99 0.002 155);
+      border-radius:8px;
+      font:inherit;
+      font-size:.95rem;
+      cursor:pointer;
+    }
+    #speedtest:hover{background:var(--primary-strong)}
+    #speedtest:disabled{
+      background:var(--muted);
+      border-color:var(--muted);
+      color:oklch(0.96 0.004 155);
+      cursor:not-allowed;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>{{heading}}</h1>
+    <div class="panel">
+      <ul>
+        {{#items}}
+        <li><a href="{{href}}">{{label}}</a></li>
+        {{/items}}
+      </ul>
+    </div>
+  </div>
+  {{{speedtest_script}}}
+</body>
+</html>

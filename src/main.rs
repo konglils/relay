@@ -1,4 +1,5 @@
 use std::env;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 
@@ -73,12 +74,32 @@ struct AppState {
     root: Option<PathBuf>,
 }
 
+struct TemplateContext {
+    vars: HashMap<&'static str, String>,
+    sections: HashMap<&'static str, Vec<HashMap<&'static str, String>>>,
+}
+
+const LISTING_TEMPLATE: &str = include_str!("../templates/listing.html");
+const SPEEDTEST_TEMPLATE: &str = include_str!("../templates/speedtest.html");
+
+impl TemplateContext {
+    fn new() -> Self {
+        Self {
+            vars: HashMap::new(),
+            sections: HashMap::new(),
+        }
+    }
+}
+
 async fn handle_root(
     State(state): State<AppState>,
     req: Request<Body>,
 ) -> Result<Response, Response> {
     if state.root.is_none() {
-        let html = render_speedtest_only();
+        let html = match render_speedtest_only().await {
+            Ok(value) => value,
+            Err(_) => return Err(server_error()),
+        };
         return Ok(Html(html).into_response());
     }
     handle_path_impl(state, "".to_string(), req).await
@@ -181,16 +202,7 @@ async fn render_directory_listing(root: &Path, relative: &Path) -> Result<String
         format!("/{}", base)
     };
 
-    let mut html = String::new();
-    html.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
-    html.push_str("<title>Index of ");
-    html.push_str(&escape_html(&base_prefix));
-    html.push_str("</title>");
-    html.push_str("<style>body{font-family:system-ui,sans-serif;padding:24px}a{text-decoration:none}li{margin:4px 0}</style>");
-    html.push_str("</head><body>");
-    html.push_str("<h1>Index of ");
-    html.push_str(&escape_html(&base_prefix));
-    html.push_str("</h1><ul>");
+    let mut items = Vec::new();
 
     if !relative.as_os_str().is_empty() {
         let parent = relative.parent().unwrap_or_else(|| Path::new(""));
@@ -199,9 +211,10 @@ async fn render_directory_listing(root: &Path, relative: &Path) -> Result<String
         } else {
             format!("/{}", parent.to_string_lossy())
         };
-        html.push_str("<li><a href=\"");
-        html.push_str(&escape_html(&parent_href));
-        html.push_str("\">..</a></li>");
+        items.push(HashMap::from([
+            ("href", parent_href),
+            ("label", "..".to_string()),
+        ]));
     }
 
     for (name, is_dir) in rows {
@@ -215,18 +228,23 @@ async fn render_directory_listing(root: &Path, relative: &Path) -> Result<String
             href.push('/');
             label.push('/');
         }
-
-        html.push_str("<li><a href=\"");
-        html.push_str(&escape_html(&href));
-        html.push_str("\">");
-        html.push_str(&escape_html(&label));
-        html.push_str("</a></li>");
+        items.push(HashMap::from([("href", href), ("label", label)]));
     }
 
-    html.push_str("</ul>");
-    html.push_str(&speedtest_button_html());
-    html.push_str("</body></html>");
-    Ok(html)
+    let page_title = if base_prefix.is_empty() {
+        "Index of /".to_string()
+    } else {
+        format!("Index of {}", base_prefix)
+    };
+    let heading = page_title.clone();
+
+    let mut ctx = TemplateContext::new();
+    ctx.vars.insert("title", page_title);
+    ctx.vars.insert("heading", heading);
+    ctx.vars
+        .insert("speedtest_script", speedtest_button_html_and_script());
+    ctx.sections.insert("items", items);
+    render_template("listing.html", &ctx).await
 }
 
 fn escape_html(input: &str) -> String {
@@ -252,40 +270,99 @@ fn server_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
 }
 
-fn speedtest_button_html() -> String {
-    let mut html = String::new();
-    html.push_str("<button id=\"speedtest\" style=\"position:fixed;right:20px;bottom:20px;padding:10px 16px\">测速</button>");
-    html.push_str("<script>");
-    html.push_str("const btn=document.getElementById('speedtest');");
-    html.push_str("btn.addEventListener('click',async()=>{");
-    html.push_str("btn.disabled=true;const original=btn.textContent;btn.textContent='测速中';");
-    html.push_str("const start=performance.now();let received=0;");
-    html.push_str("const controller=new AbortController();");
-    html.push_str("setTimeout(()=>controller.abort(),10000);");
-    html.push_str("try{");
-    html.push_str(
+fn speedtest_button_html_and_script() -> String {
+    [
+        "<button id=\"speedtest\">测速</button>",
+        "<script>",
+        "const btn=document.getElementById('speedtest');",
+        "btn.addEventListener('click',async()=>{",
+        "btn.disabled=true;const original=btn.textContent;btn.textContent='测速中';",
+        "const start=performance.now();let received=0;",
+        "const controller=new AbortController();",
+        "setTimeout(()=>controller.abort(),10000);",
+        "try{",
         "const res=await fetch('/__speedtest',{signal:controller.signal,cache:'no-store'});",
-    );
-    html.push_str("const reader=res.body.getReader();");
-    html.push_str("while(true){const {done,value}=await reader.read();if(done)break;received+=value.byteLength;}");
-    html.push_str("}catch(e){}");
-    html.push_str("const end=performance.now();const seconds=(end-start)/1000;");
-    html.push_str("const mbps=(received*8)/(seconds*1000*1000);");
-    html.push_str("alert(`接收 ${received} 字节，耗时 ${seconds.toFixed(2)} 秒，速度约 ${mbps.toFixed(2)} Mbps`);");
-    html.push_str("btn.textContent=original;btn.disabled=false;");
-    html.push_str("});");
-    html.push_str("</script>");
-    html
+        "const reader=res.body.getReader();",
+        "while(true){const {done,value}=await reader.read();if(done)break;received+=value.byteLength;}",
+        "}catch(e){}",
+        "const end=performance.now();const seconds=(end-start)/1000;",
+        "const mbps=(received*8)/(seconds*1000*1000);",
+        "alert(`接收 ${received} 字节，耗时 ${seconds.toFixed(2)} 秒，速度约 ${mbps.toFixed(2)} Mbps`);",
+        "btn.textContent=original;btn.disabled=false;",
+        "});",
+        "</script>",
+    ]
+    .join("")
 }
 
-fn render_speedtest_only() -> String {
-    let mut html = String::new();
-    html.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
-    html.push_str("<title>Speed Test</title>");
-    html.push_str("<style>body{font-family:system-ui,sans-serif;padding:24px}</style>");
-    html.push_str("</head><body>");
-    html.push_str("<h1>Speed Test</h1>");
-    html.push_str(&speedtest_button_html());
-    html.push_str("</body></html>");
-    html
+async fn render_speedtest_only() -> Result<String, std::io::Error> {
+    let mut ctx = TemplateContext::new();
+    ctx.vars.insert("title", "Speed Test".to_string());
+    ctx.vars.insert("heading", "Speed Test".to_string());
+    ctx.vars.insert(
+        "description",
+        "点击右下角按钮开始测试当前连接下载速度。".to_string(),
+    );
+    ctx.vars
+        .insert("speedtest_script", speedtest_button_html_and_script());
+    render_template("speedtest.html", &ctx).await
+}
+
+async fn render_template(name: &str, ctx: &TemplateContext) -> Result<String, std::io::Error> {
+    let template = match name {
+        "listing.html" => LISTING_TEMPLATE,
+        "speedtest.html" => SPEEDTEST_TEMPLATE,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "template not found",
+            ));
+        }
+    };
+    Ok(apply_template(template, ctx))
+}
+
+fn apply_template(template: &str, ctx: &TemplateContext) -> String {
+    let with_sections = render_sections(template, &ctx.sections);
+    render_vars(&with_sections, &ctx.vars)
+}
+
+fn render_sections(
+    template: &str,
+    sections: &HashMap<&'static str, Vec<HashMap<&'static str, String>>>,
+) -> String {
+    let mut output = template.to_string();
+    for (name, rows) in sections {
+        let start_tag = format!("{{{{#{name}}}}}");
+        let end_tag = format!("{{{{/{name}}}}}");
+
+        while let Some(start) = output.find(&start_tag) {
+            let inner_start = start + start_tag.len();
+            let Some(relative_end) = output[inner_start..].find(&end_tag) else {
+                break;
+            };
+            let end = inner_start + relative_end;
+            let block = &output[inner_start..end];
+
+            let mut rendered = String::new();
+            for row in rows {
+                rendered.push_str(&render_vars(block, row));
+            }
+
+            let replace_end = end + end_tag.len();
+            output.replace_range(start..replace_end, &rendered);
+        }
+    }
+    output
+}
+
+fn render_vars(template: &str, vars: &HashMap<&'static str, String>) -> String {
+    let mut output = template.to_string();
+    for (key, value) in vars {
+        let token = format!("{{{{{key}}}}}");
+        output = output.replace(&token, &escape_html(value));
+        let raw_token = format!("{{{{{{{key}}}}}}}");
+        output = output.replace(&raw_token, value);
+    }
+    output
 }
