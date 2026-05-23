@@ -5,9 +5,9 @@ use std::path::{Component, Path, PathBuf};
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Query, State};
 use axum::http::{Request, StatusCode, header};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use bytes::Bytes;
 use futures_util::stream::Stream;
@@ -51,9 +51,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = format!("[::]:{}", port).parse()?;
     let state = AppState { root };
     let app = Router::new()
-        .route("/", get(handle_root))
-        .route("/{*path}", get(handle_path))
-        .route("/__speedtest", get(handle_speedtest))
+        .route("/", get(redirect_root))
+        .route("/file", get(handle_file))
+        .route("/sytle.css", get(handle_style_css))
+        .route("/app.js", get(handle_app_js))
+        .route("/speedtest", get(handle_speedtest))
         .with_state(state);
 
     println!("Serving on http://{}", addr);
@@ -81,6 +83,8 @@ struct TemplateContext {
 
 const LISTING_TEMPLATE: &str = include_str!("../templates/listing.html");
 const SPEEDTEST_TEMPLATE: &str = include_str!("../templates/speedtest.html");
+const STYLE_CSS: &str = include_str!("../templates/sytle.css");
+const APP_JS: &str = include_str!("../templates/app.js");
 
 impl TemplateContext {
     fn new() -> Self {
@@ -91,8 +95,13 @@ impl TemplateContext {
     }
 }
 
-async fn handle_root(
+async fn redirect_root() -> Redirect {
+    Redirect::to("/file?loc=/")
+}
+
+async fn handle_file(
     State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
     req: Request<Body>,
 ) -> Result<Response, Response> {
     if state.root.is_none() {
@@ -102,14 +111,12 @@ async fn handle_root(
         };
         return Ok(Html(html).into_response());
     }
-    handle_path_impl(state, "".to_string(), req).await
-}
 
-async fn handle_path(
-    State(state): State<AppState>,
-    AxumPath(path): AxumPath<String>,
-    req: Request<Body>,
-) -> Result<Response, Response> {
+    let loc = params.get("loc").map(String::as_str).unwrap_or("/");
+    let path = match normalize_loc(loc) {
+        Some(value) => value,
+        None => return Err(not_found()),
+    };
     handle_path_impl(state, path, req).await
 }
 
@@ -159,6 +166,22 @@ async fn handle_speedtest() -> Response {
     response
 }
 
+async fn handle_style_css() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        STYLE_CSS,
+    )
+        .into_response()
+}
+
+async fn handle_app_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        APP_JS,
+    )
+        .into_response()
+}
+
 fn speedtest_stream() -> impl Stream<Item = Result<Bytes, std::io::Error>> {
     async_stream::stream! {
         let mut buffer = vec![0u8; 64 * 1024];
@@ -180,6 +203,14 @@ fn sanitize_path(path: &str) -> Option<PathBuf> {
         }
     }
     Some(result)
+}
+
+fn normalize_loc(loc: &str) -> Option<String> {
+    if loc.is_empty() || loc == "/" {
+        return Some(String::new());
+    }
+    let stripped = loc.strip_prefix('/')?;
+    Some(stripped.to_string())
 }
 
 async fn render_directory_listing(root: &Path, relative: &Path) -> Result<String, std::io::Error> {
@@ -207,9 +238,9 @@ async fn render_directory_listing(root: &Path, relative: &Path) -> Result<String
     if !relative.as_os_str().is_empty() {
         let parent = relative.parent().unwrap_or_else(|| Path::new(""));
         let parent_href = if parent.as_os_str().is_empty() {
-            "/".to_string()
+            "/file?loc=/".to_string()
         } else {
-            format!("/{}", parent.to_string_lossy())
+            format!("/file?loc=/{}/", parent.to_string_lossy())
         };
         items.push(HashMap::from([
             ("href", parent_href),
@@ -219,9 +250,9 @@ async fn render_directory_listing(root: &Path, relative: &Path) -> Result<String
 
     for (name, is_dir) in rows {
         let mut href = if base_prefix.is_empty() {
-            format!("/{}", name)
+            format!("/file?loc=/{}", name)
         } else {
-            format!("{}/{}", base_prefix, name)
+            format!("/file?loc={}/{}", base_prefix, name)
         };
         let mut label = name;
         if is_dir {
@@ -241,8 +272,6 @@ async fn render_directory_listing(root: &Path, relative: &Path) -> Result<String
     let mut ctx = TemplateContext::new();
     ctx.vars.insert("title", page_title);
     ctx.vars.insert("heading", heading);
-    ctx.vars
-        .insert("speedtest_script", speedtest_button_html_and_script());
     ctx.sections.insert("items", items);
     render_template("listing.html", &ctx).await
 }
@@ -270,31 +299,6 @@ fn server_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
 }
 
-fn speedtest_button_html_and_script() -> String {
-    [
-        "<button id=\"speedtest\">测速</button>",
-        "<script>",
-        "const btn=document.getElementById('speedtest');",
-        "btn.addEventListener('click',async()=>{",
-        "btn.disabled=true;const original=btn.textContent;btn.textContent='测速中';",
-        "const start=performance.now();let received=0;",
-        "const controller=new AbortController();",
-        "setTimeout(()=>controller.abort(),10000);",
-        "try{",
-        "const res=await fetch('/__speedtest',{signal:controller.signal,cache:'no-store'});",
-        "const reader=res.body.getReader();",
-        "while(true){const {done,value}=await reader.read();if(done)break;received+=value.byteLength;}",
-        "}catch(e){}",
-        "const end=performance.now();const seconds=(end-start)/1000;",
-        "const mbps=(received*8)/(seconds*1000*1000);",
-        "alert(`接收 ${received} 字节，耗时 ${seconds.toFixed(2)} 秒，速度约 ${mbps.toFixed(2)} Mbps`);",
-        "btn.textContent=original;btn.disabled=false;",
-        "});",
-        "</script>",
-    ]
-    .join("")
-}
-
 async fn render_speedtest_only() -> Result<String, std::io::Error> {
     let mut ctx = TemplateContext::new();
     ctx.vars.insert("title", "Speed Test".to_string());
@@ -303,8 +307,6 @@ async fn render_speedtest_only() -> Result<String, std::io::Error> {
         "description",
         "点击右下角按钮开始测试当前连接下载速度。".to_string(),
     );
-    ctx.vars
-        .insert("speedtest_script", speedtest_button_html_and_script());
     render_template("speedtest.html", &ctx).await
 }
 
