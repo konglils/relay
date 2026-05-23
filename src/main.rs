@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn usage(message: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Error: {message}");
-    eprintln!("Usage: file-share <port> [root_path]");
+    eprintln!("Usage: relay <port> [root_path]");
     Err("invalid arguments".into())
 }
 

@@ -101,20 +101,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
-name = "file-share"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "axum",
- "bytes",
- "fastrand",
- "futures-util",
- "tokio",
- "tower",
- "tower-http",
-]
-
-[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -358,6 +344,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "relay"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "axum",
+ "bytes",
+ "fastrand",
+ "futures-util",
+ "tokio",
+ "tower",
+ "tower-http",
 ]
 
 [[package]]
