@@ -1,0 +1,75 @@
+name: Build Release Binaries
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            bin_name: relay
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            bin_name: relay
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_name: relay
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin_name: relay
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: relay.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig and cargo-zigbuild (aarch64 musl only)
+        if: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: zig,cargo-zigbuild
+
+      - name: Setup Android NDK (android only)
+        if: matrix.target == 'aarch64-linux-android'
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      - name: Configure Android linker (android only)
+        if: matrix.target == 'aarch64-linux-android'
+        shell: bash
+        run: |
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> "$GITHUB_ENV"
+
+      - name: Build (aarch64 musl with zigbuild)
+        if: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
+        shell: bash
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Build (default cargo)
+        if: ${{ matrix.target != 'aarch64-unknown-linux-musl' }}
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.bin_name }}
+          if-no-files-found: error
