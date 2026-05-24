@@ -10,6 +10,10 @@
 - 单二进制部署（HTML/CSS/JS 在编译期内嵌）
 - 启动时打印可分享地址，优先 IPv6
 
+## 下载
+
+登录 Github 账号，打开 [Github Actions 页面](https://github.com/konglils/relay/actions)，选择最新的成功构建，在页面底部下载对应平台的 Artifacts。
+
 ## 编译
 
 推荐使用 `musl` 进行静态构建，便于分发：
