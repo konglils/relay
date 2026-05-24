@@ -38,11 +38,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Zig and cargo-zigbuild (aarch64 musl only)
+      - name: Install cargo-zigbuild (aarch64 musl only)
         if: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
         uses: taiki-e/install-action@v2
         with:
-          tool: zig,cargo-zigbuild
+          tool: cargo-zigbuild
+
+      - name: Setup Zig (aarch64 musl only)
+        if: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: latest
 
       - name: Setup Android NDK (android only)
         if: matrix.target == 'aarch64-linux-android'
