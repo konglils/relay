@@ -11,9 +11,34 @@
     <div class="panel">
       <h1>{{heading}}</h1>
       <p>{{description}}</p>
+      <div class="speedtest-actions">
+        <button
+          id="root-qr-btn"
+          class="qr-btn"
+          type="button"
+          data-href="/file?loc=/"
+          data-label="/"
+          aria-label="显示二维码"
+        >
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM16 14h2v2h-2zM14 16h2v2h-2zM18 16h2v2h-2zM16 18h4v2h-4z" stroke="currentColor" stroke-width="1.5"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </div>
+  <div id="qr-modal" role="dialog" aria-modal="true" aria-labelledby="qr-title">
+    <div class="qr-dialog">
+      <h2 id="qr-title" class="qr-title"></h2>
+      <div id="qr-code"></div>
+      <div class="qr-actions">
+        <button id="qr-copy" class="btn primary" type="button">复制链接</button>
+        <button id="qr-close" class="btn" type="button">关闭</button>
+      </div>
     </div>
   </div>
   <button id="speedtest" type="button">测速</button>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

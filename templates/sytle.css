@@ -72,6 +72,15 @@ li{margin:0}
   border-color:var(--primary-strong);
 }
 .qr-btn svg{width:17px;height:17px}
+.speedtest-actions{
+  margin-top:12px;
+  display:flex;
+  justify-content:flex-end;
+}
+.speedtest-actions .qr-btn{
+  opacity:1;
+  pointer-events:auto;
+}
 #qr-modal{
   position:fixed;
   inset:0;
