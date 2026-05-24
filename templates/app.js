@@ -1,4 +1,29 @@
 (function () {
+  function flashCopiedState(button) {
+    button.textContent = "已复制";
+    setTimeout(() => {
+      button.textContent = "复制链接";
+    }, 1200);
+  }
+
+  function fallbackCopyText(text) {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    textarea.style.pointerEvents = "none";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch (_) {}
+    document.body.removeChild(textarea);
+    return ok;
+  }
+
   function initSpeedtest() {
     const btn = document.getElementById("speedtest");
     if (!btn) return;
@@ -92,12 +117,16 @@
     qrCopy.addEventListener("click", async () => {
       if (!currentUrl) return;
       try {
-        await navigator.clipboard.writeText(currentUrl);
-        qrCopy.textContent = "已复制";
-        setTimeout(() => {
-          qrCopy.textContent = "复制链接";
-        }, 1200);
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(currentUrl);
+          flashCopiedState(qrCopy);
+          return;
+        }
       } catch (_) {}
+
+      if (fallbackCopyText(currentUrl)) {
+        flashCopiedState(qrCopy);
+      }
     });
   }
 
