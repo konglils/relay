@@ -61,8 +61,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print_access_urls(port);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    let listener_v6 = tokio::net::TcpListener::bind(addr).await?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
+        match tokio::net::TcpListener::bind(addr_v4).await {
+            Ok(listener_v4) => {
+                let app_v6 = app.clone();
+                tokio::try_join!(
+                    axum::serve(listener_v6, app_v6),
+                    axum::serve(listener_v4, app)
+                )?;
+            }
+            Err(_) => {
+                axum::serve(listener_v6, app).await?;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        axum::serve(listener_v6, app).await?;
+    }
     Ok(())
 }
 
@@ -107,7 +128,7 @@ struct InterfaceIp {
     ip: IpAddr,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn collect_interface_ips() -> Vec<InterfaceIp> {
     use std::ffi::CStr;
 
@@ -134,7 +155,7 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
                 let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
                     .to_string_lossy()
                     .into_owned();
-                if is_physical_interface_linux(&name) {
+                if is_shareable_interface_unix(&name) {
                     // SAFETY: `ifa_addr` points to a sockaddr with family-dispatched layout.
                     let family = unsafe { (*ifa.ifa_addr).sa_family as i32 };
                     match family {
@@ -164,11 +185,17 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
 }
 
 #[cfg(target_os = "linux")]
-fn is_physical_interface_linux(name: &str) -> bool {
+fn is_shareable_interface_unix(name: &str) -> bool {
     let sys_path = Path::new("/sys/class/net").join(name);
     let device_path = sys_path.join("device");
     let virtual_path = Path::new("/sys/devices/virtual/net").join(name);
     device_path.exists() && !virtual_path.exists()
+}
+
+#[cfg(target_os = "android")]
+fn is_shareable_interface_unix(_name: &str) -> bool {
+    // Android 上很多可用接口在 sysfs 中显示为 virtual，不能用 Linux 桌面那套物理设备规则过滤。
+    true
 }
 
 #[cfg(target_os = "windows")]
@@ -176,10 +203,10 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
     use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
-        GAA_FLAG_SKIP_FRIENDLY_NAME, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_ADDRESS_TRANSIENT,
     };
     use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+        AF_INET, AF_INET6, AF_UNSPEC, IpDadStatePreferred, SOCKADDR_IN, SOCKADDR_IN6,
     };
 
     const IF_OPER_STATUS_UP: i32 = 1;
@@ -196,8 +223,7 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
             AF_UNSPEC as u32,
             GAA_FLAG_SKIP_ANYCAST
                 | GAA_FLAG_SKIP_MULTICAST
-                | GAA_FLAG_SKIP_DNS_SERVER
-                | GAA_FLAG_SKIP_FRIENDLY_NAME,
+                | GAA_FLAG_SKIP_DNS_SERVER,
             std::ptr::null_mut(),
             buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
             &mut buflen,
@@ -212,8 +238,7 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
                 AF_UNSPEC as u32,
                 GAA_FLAG_SKIP_ANYCAST
                     | GAA_FLAG_SKIP_MULTICAST
-                    | GAA_FLAG_SKIP_DNS_SERVER
-                    | GAA_FLAG_SKIP_FRIENDLY_NAME,
+                    | GAA_FLAG_SKIP_DNS_SERVER,
                 std::ptr::null_mut(),
                 buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
                 &mut buflen,
@@ -229,9 +254,11 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
     while !adapter.is_null() {
         // SAFETY: `adapter` is part of the linked list returned by the API.
         let ad = unsafe { &*adapter };
+        let friendly = wchar_ptr_to_string(ad.FriendlyName);
         let is_up = ad.OperStatus == IF_OPER_STATUS_UP;
         let allowed_type = ad.IfType != IF_TYPE_SOFTWARE_LOOPBACK && ad.IfType != IF_TYPE_TUNNEL;
-        if is_up && allowed_type {
+        let not_virtual = !looks_virtual_windows_interface(&friendly);
+        if is_up && allowed_type && not_virtual {
             let mut uni = ad.FirstUnicastAddress;
             while !uni.is_null() {
                 // SAFETY: `uni` is a node in adapter's unicast linked list.
@@ -254,7 +281,15 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
                             let s6 = unsafe { &*(sa as *const SOCKADDR_IN6) };
                             // SAFETY: reading union field for IPv6 byte view.
                             let ip = Ipv6Addr::from(unsafe { s6.sin6_addr.u.Byte });
-                            out.push(InterfaceIp { ip: IpAddr::V6(ip) });
+                            // Prefer temporary IPv6 addresses only; also exclude tentative/deprecated.
+                            // SAFETY: field access through documented union layout.
+                            let flags = unsafe { u.Anonymous.Anonymous.Flags };
+                            let is_transient = (flags & IP_ADAPTER_ADDRESS_TRANSIENT) != 0;
+                            let dad_preferred = u.DadState == IpDadStatePreferred;
+                            let not_expired = u.PreferredLifetime > 0;
+                            if is_transient && dad_preferred && not_expired {
+                                out.push(InterfaceIp { ip: IpAddr::V6(ip) });
+                            }
                         }
                         _ => {}
                     }
@@ -268,7 +303,43 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
     out
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "windows")]
+fn wchar_ptr_to_string(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    // SAFETY: `ptr` is NUL-terminated UTF-16 from Windows API.
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn looks_virtual_windows_interface(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let hints = [
+        "virtual",
+        "hyper-v",
+        "vmware",
+        "virtualbox",
+        "vbox",
+        "wsl",
+        "tap",
+        "tun",
+        "tailscale",
+        "zerotier",
+        "docker",
+        "loopback",
+        "vpn",
+    ];
+    hints.iter().any(|h| lower.contains(h))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
 fn collect_interface_ips() -> Vec<InterfaceIp> {
     Vec::new()
 }
@@ -317,7 +388,7 @@ fn is_public_ipv6(v6: Ipv6Addr) -> bool {
         || v6.is_unicast_link_local())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn linux_temporary_ipv6_set() -> Option<HashSet<Ipv6Addr>> {
     const IFA_F_TEMPORARY: u32 = 0x01;
     const IFA_F_DEPRECATED: u32 = 0x20;
@@ -380,7 +451,7 @@ fn linux_temporary_ipv6_set() -> Option<HashSet<Ipv6Addr>> {
     Some(set)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn linux_temporary_ipv6_set() -> Option<HashSet<Ipv6Addr>> {
     None
 }
