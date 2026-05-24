@@ -20,6 +20,9 @@ fastrand = "2"
 # Stream traits for async streaming responses.
 futures-util = "0.3"
 
+# Unix low-level networking/syscall bindings.
+libc = "0.2"
+
 # Core concurrency support crate.
 # Feature fs and io-util enables filesystem support.
 # the last two features enable asynchronization in main function.
@@ -30,3 +33,12 @@ tower = "0.5"
 
 # HTTP utilities for serving files.
 tower-http = { version = "0.6", features = ["fs"] }
+
+# Windows API bindings for adapter enumeration.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
+] }

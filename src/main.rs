@@ -1,6 +1,7 @@
 use std::env;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 
 use axum::Router;
@@ -58,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/speedtest", get(handle_speedtest))
         .with_state(state);
 
-    println!("Serving on http://{}", addr);
+    print_access_urls(port);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -69,6 +70,319 @@ fn usage(message: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Error: {message}");
     eprintln!("Usage: relay <port> [root_path]");
     Err("invalid arguments".into())
+}
+
+fn print_access_urls(port: u16) {
+    let ifaces = collect_interface_ips();
+    let temporary_ipv6 = linux_temporary_ipv6_set();
+
+    let mut urls = Vec::new();
+    for iface in ifaces {
+        let ip = iface.ip;
+        if !is_shareable_ip(ip, temporary_ipv6.as_ref()) {
+            continue;
+        }
+        let url = match ip {
+            IpAddr::V4(v4) => format!("http://{}:{port}", v4),
+            IpAddr::V6(v6) => format!("http://[{v6}]:{port}"),
+        };
+        urls.push((ip_priority(ip), url));
+    }
+
+    urls.sort_by_key(|(priority, url)| (*priority, url.clone()));
+    urls.dedup_by(|a, b| a.1 == b.1);
+
+    if urls.is_empty() {
+        return;
+    }
+
+    println!("Available sharing URLs:");
+    for (_, url) in urls {
+        println!("  {url}");
+    }
+}
+
+#[derive(Clone, Debug)]
+struct InterfaceIp {
+    ip: IpAddr,
+}
+
+#[cfg(target_os = "linux")]
+fn collect_interface_ips() -> Vec<InterfaceIp> {
+    use std::ffi::CStr;
+
+    let mut out = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+
+    // SAFETY: libc guarantees `getifaddrs` initializes `ifap` on success.
+    let rc = unsafe { libc::getifaddrs(&mut ifap) };
+    if rc != 0 || ifap.is_null() {
+        return out;
+    }
+
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a valid node from the linked list returned by `getifaddrs`.
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_addr.is_null() {
+            let flags = ifa.ifa_flags as i32;
+            let is_up = (flags & libc::IFF_UP) != 0;
+            let is_loopback = (flags & libc::IFF_LOOPBACK) != 0;
+
+            if is_up && !is_loopback {
+                // SAFETY: `ifa_name` is a valid NUL-terminated C string for each entry.
+                let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
+                    .to_string_lossy()
+                    .into_owned();
+                if is_physical_interface_linux(&name) {
+                    // SAFETY: `ifa_addr` points to a sockaddr with family-dispatched layout.
+                    let family = unsafe { (*ifa.ifa_addr).sa_family as i32 };
+                    match family {
+                        libc::AF_INET => {
+                            // SAFETY: family is AF_INET so cast is valid.
+                            let sa = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                            let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+                            out.push(InterfaceIp { ip: IpAddr::V4(ip) });
+                        }
+                        libc::AF_INET6 => {
+                            // SAFETY: family is AF_INET6 so cast is valid.
+                            let sa = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                            let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
+                            out.push(InterfaceIp { ip: IpAddr::V6(ip) });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+
+    // SAFETY: `ifap` was returned by `getifaddrs`.
+    unsafe { libc::freeifaddrs(ifap) };
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn is_physical_interface_linux(name: &str) -> bool {
+    let sys_path = Path::new("/sys/class/net").join(name);
+    let device_path = sys_path.join("device");
+    let virtual_path = Path::new("/sys/devices/virtual/net").join(name);
+    device_path.exists() && !virtual_path.exists()
+}
+
+#[cfg(target_os = "windows")]
+fn collect_interface_ips() -> Vec<InterfaceIp> {
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+        GAA_FLAG_SKIP_FRIENDLY_NAME, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+    };
+
+    const IF_OPER_STATUS_UP: i32 = 1;
+    const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
+    const IF_TYPE_TUNNEL: u32 = 131;
+
+    let mut out = Vec::new();
+    let mut buflen: u32 = 16 * 1024;
+    let mut buf: Vec<u8> = vec![0; buflen as usize];
+
+    // SAFETY: We pass a valid mutable byte buffer and size pointer per API contract.
+    let mut ret = unsafe {
+        GetAdaptersAddresses(
+            AF_UNSPEC as u32,
+            GAA_FLAG_SKIP_ANYCAST
+                | GAA_FLAG_SKIP_MULTICAST
+                | GAA_FLAG_SKIP_DNS_SERVER
+                | GAA_FLAG_SKIP_FRIENDLY_NAME,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+            &mut buflen,
+        )
+    };
+
+    if ret == ERROR_BUFFER_OVERFLOW {
+        buf.resize(buflen as usize, 0);
+        // SAFETY: Buffer was resized to requested length from previous call.
+        ret = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                GAA_FLAG_SKIP_ANYCAST
+                    | GAA_FLAG_SKIP_MULTICAST
+                    | GAA_FLAG_SKIP_DNS_SERVER
+                    | GAA_FLAG_SKIP_FRIENDLY_NAME,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                &mut buflen,
+            )
+        };
+    }
+
+    if ret != NO_ERROR {
+        return out;
+    }
+
+    let mut adapter = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while !adapter.is_null() {
+        // SAFETY: `adapter` is part of the linked list returned by the API.
+        let ad = unsafe { &*adapter };
+        let is_up = ad.OperStatus == IF_OPER_STATUS_UP;
+        let allowed_type = ad.IfType != IF_TYPE_SOFTWARE_LOOPBACK && ad.IfType != IF_TYPE_TUNNEL;
+        if is_up && allowed_type {
+            let mut uni = ad.FirstUnicastAddress;
+            while !uni.is_null() {
+                // SAFETY: `uni` is a node in adapter's unicast linked list.
+                let u = unsafe { &*uni };
+                let sa = u.Address.lpSockaddr;
+                if !sa.is_null() {
+                    // SAFETY: `sa` points to a valid sockaddr.
+                    let family = unsafe { (*sa).sa_family };
+                    match family {
+                        AF_INET => {
+                            // SAFETY: family-dispatched cast.
+                            let s4 = unsafe { &*(sa as *const SOCKADDR_IN) };
+                            // SAFETY: reading union field for IPv4 byte view.
+                            let oct = unsafe { s4.sin_addr.S_un.S_un_b };
+                            let ip = Ipv4Addr::new(oct.s_b1, oct.s_b2, oct.s_b3, oct.s_b4);
+                            out.push(InterfaceIp { ip: IpAddr::V4(ip) });
+                        }
+                        AF_INET6 => {
+                            // SAFETY: family-dispatched cast.
+                            let s6 = unsafe { &*(sa as *const SOCKADDR_IN6) };
+                            // SAFETY: reading union field for IPv6 byte view.
+                            let ip = Ipv6Addr::from(unsafe { s6.sin6_addr.u.Byte });
+                            out.push(InterfaceIp { ip: IpAddr::V6(ip) });
+                        }
+                        _ => {}
+                    }
+                }
+                uni = u.Next;
+            }
+        }
+        adapter = ad.Next;
+    }
+
+    out
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn collect_interface_ips() -> Vec<InterfaceIp> {
+    Vec::new()
+}
+
+fn ip_priority(ip: IpAddr) -> u8 {
+    match ip {
+        IpAddr::V6(v6) if is_public_ipv6(v6) => 0,
+        IpAddr::V4(v4) if is_public_ipv4(v4) => 1,
+        IpAddr::V4(_) => 2,
+        IpAddr::V6(_) => 3,
+    }
+}
+
+fn is_shareable_ip(ip: IpAddr, temporary_ipv6: Option<&HashSet<Ipv6Addr>>) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast())
+        }
+        IpAddr::V6(v6) => {
+            if !is_public_ipv6(v6) {
+                return false;
+            }
+            if let Some(temp_set) = temporary_ipv6 {
+                return temp_set.contains(&v6);
+            }
+            true
+        }
+    }
+}
+
+fn is_public_ipv4(v4: Ipv4Addr) -> bool {
+    !(v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_unspecified()
+        || v4.is_documentation()
+        || v4.octets()[0] == 0)
+}
+
+fn is_public_ipv6(v6: Ipv6Addr) -> bool {
+    !(v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast()
+        || v6.is_unique_local()
+        || v6.is_unicast_link_local())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_temporary_ipv6_set() -> Option<HashSet<Ipv6Addr>> {
+    const IFA_F_TEMPORARY: u32 = 0x01;
+    const IFA_F_DEPRECATED: u32 = 0x20;
+    const IFA_F_TENTATIVE: u32 = 0x40;
+
+    let content = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
+    let mut set = HashSet::new();
+
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(addr_hex) = parts.next() else { continue };
+        let _index = parts.next();
+        let _prefix = parts.next();
+        let scope_hex = parts.next();
+        let flags_hex = parts.next();
+        let _if_name = parts.next();
+
+        if addr_hex.len() != 32 {
+            continue;
+        }
+        let Some(scope_hex) = scope_hex else { continue };
+        let Some(flags_hex) = flags_hex else { continue };
+
+        let Ok(scope) = u32::from_str_radix(scope_hex, 16) else {
+            continue;
+        };
+        if scope != 0 {
+            continue;
+        }
+
+        let Ok(flags) = u32::from_str_radix(flags_hex, 16) else {
+            continue;
+        };
+        let is_temporary = (flags & IFA_F_TEMPORARY) != 0;
+        let is_deprecated = (flags & IFA_F_DEPRECATED) != 0;
+        let is_tentative = (flags & IFA_F_TENTATIVE) != 0;
+        if !is_temporary || is_deprecated || is_tentative {
+            continue;
+        }
+
+        let mut octets = [0u8; 16];
+        let mut ok = true;
+        for i in 0..16 {
+            let start = i * 2;
+            let end = start + 2;
+            match u8::from_str_radix(&addr_hex[start..end], 16) {
+                Ok(byte) => octets[i] = byte,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        set.insert(Ipv6Addr::from(octets));
+    }
+
+    Some(set)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_temporary_ipv6_set() -> Option<HashSet<Ipv6Addr>> {
+    None
 }
 
 #[derive(Clone)]
