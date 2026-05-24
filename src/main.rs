@@ -62,27 +62,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_access_urls(port);
 
     let listener_v6 = tokio::net::TcpListener::bind(addr).await?;
-
-    #[cfg(target_os = "windows")]
-    {
-        let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
-        match tokio::net::TcpListener::bind(addr_v4).await {
-            Ok(listener_v4) => {
-                let app_v6 = app.clone();
-                tokio::try_join!(
-                    axum::serve(listener_v6, app_v6),
-                    axum::serve(listener_v4, app)
-                )?;
-            }
-            Err(_) => {
-                axum::serve(listener_v6, app).await?;
-            }
+    let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
+    match tokio::net::TcpListener::bind(addr_v4).await {
+        Ok(listener_v4) => {
+            let app_v6 = app.clone();
+            tokio::try_join!(
+                axum::serve(listener_v6, app_v6),
+                axum::serve(listener_v4, app)
+            )?;
         }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        axum::serve(listener_v6, app).await?;
+        Err(_) => {
+            axum::serve(listener_v6, app).await?;
+        }
     }
     Ok(())
 }
@@ -107,24 +98,26 @@ fn print_access_urls(port: u16) {
             IpAddr::V4(v4) => format!("http://{}:{port}", v4),
             IpAddr::V6(v6) => format!("http://[{v6}]:{port}"),
         };
-        urls.push((ip_priority(ip), url));
+        urls.push((ip_priority(ip), iface.name, url));
     }
 
-    urls.sort_by_key(|(priority, url)| (*priority, url.clone()));
-    urls.dedup_by(|a, b| a.1 == b.1);
+    urls.sort_by_key(|(priority, name, url)| (*priority, name.clone(), url.clone()));
+    urls.dedup_by(|a, b| a.1 == b.1 && a.2 == b.2);
 
     if urls.is_empty() {
         return;
     }
 
+    let name_width = urls.iter().map(|(_, name, _)| name.len()).max().unwrap_or(0);
     println!("Available sharing URLs:");
-    for (_, url) in urls {
-        println!("  {url}");
+    for (_, name, url) in urls {
+        println!("  {:name_width$}  {}", name, url, name_width = name_width);
     }
 }
 
 #[derive(Clone, Debug)]
 struct InterfaceIp {
+    name: String,
     ip: IpAddr,
 }
 
@@ -163,13 +156,19 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
                             // SAFETY: family is AF_INET so cast is valid.
                             let sa = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
                             let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
-                            out.push(InterfaceIp { ip: IpAddr::V4(ip) });
+                            out.push(InterfaceIp {
+                                name: name.clone(),
+                                ip: IpAddr::V4(ip),
+                            });
                         }
                         libc::AF_INET6 => {
                             // SAFETY: family is AF_INET6 so cast is valid.
                             let sa = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
                             let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
-                            out.push(InterfaceIp { ip: IpAddr::V6(ip) });
+                            out.push(InterfaceIp {
+                                name: name.clone(),
+                                ip: IpAddr::V6(ip),
+                            });
                         }
                         _ => {}
                     }
@@ -274,7 +273,10 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
                             // SAFETY: reading union field for IPv4 byte view.
                             let oct = unsafe { s4.sin_addr.S_un.S_un_b };
                             let ip = Ipv4Addr::new(oct.s_b1, oct.s_b2, oct.s_b3, oct.s_b4);
-                            out.push(InterfaceIp { ip: IpAddr::V4(ip) });
+                            out.push(InterfaceIp {
+                                name: friendly.clone(),
+                                ip: IpAddr::V4(ip),
+                            });
                         }
                         AF_INET6 => {
                             // SAFETY: family-dispatched cast.
@@ -288,7 +290,10 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
                             let dad_preferred = u.DadState == IpDadStatePreferred;
                             let not_expired = u.PreferredLifetime > 0;
                             if is_transient && dad_preferred && not_expired {
-                                out.push(InterfaceIp { ip: IpAddr::V6(ip) });
+                                out.push(InterfaceIp {
+                                    name: friendly.clone(),
+                                    ip: IpAddr::V6(ip),
+                                });
                             }
                         }
                         _ => {}
