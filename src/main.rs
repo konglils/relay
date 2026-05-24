@@ -205,7 +205,8 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
         GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_ADDRESS_TRANSIENT,
     };
     use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, AF_INET6, AF_UNSPEC, IpDadStatePreferred, SOCKADDR_IN, SOCKADDR_IN6,
+        AF_INET, AF_INET6, AF_UNSPEC, IpDadStatePreferred, IpSuffixOriginRandom, SOCKADDR_IN,
+        SOCKADDR_IN6,
     };
 
     const IF_OPER_STATUS_UP: i32 = 1;
@@ -258,6 +259,7 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
         let allowed_type = ad.IfType != IF_TYPE_SOFTWARE_LOOPBACK && ad.IfType != IF_TYPE_TUNNEL;
         let not_virtual = !looks_virtual_windows_interface(&friendly);
         if is_up && allowed_type && not_virtual {
+            let mut best_ipv6: Option<(u8, Ipv6Addr)> = None;
             let mut uni = ad.FirstUnicastAddress;
             while !uni.is_null() {
                 // SAFETY: `uni` is a node in adapter's unicast linked list.
@@ -283,23 +285,34 @@ fn collect_interface_ips() -> Vec<InterfaceIp> {
                             let s6 = unsafe { &*(sa as *const SOCKADDR_IN6) };
                             // SAFETY: reading union field for IPv6 byte view.
                             let ip = Ipv6Addr::from(unsafe { s6.sin6_addr.u.Byte });
-                            // Prefer temporary IPv6 addresses only; also exclude tentative/deprecated.
-                            // SAFETY: field access through documented union layout.
-                            let flags = unsafe { u.Anonymous.Anonymous.Flags };
-                            let is_transient = (flags & IP_ADAPTER_ADDRESS_TRANSIENT) != 0;
                             let dad_preferred = u.DadState == IpDadStatePreferred;
                             let not_expired = u.PreferredLifetime > 0;
-                            if is_transient && dad_preferred && not_expired {
-                                out.push(InterfaceIp {
-                                    name: friendly.clone(),
-                                    ip: IpAddr::V6(ip),
-                                });
+                            if dad_preferred && not_expired && is_public_ipv6(ip) {
+                                // Temporary IPv6 heuristic on Windows:
+                                // 1) SuffixOrigin=Random (preferred)
+                                // 2) TRANSIENT flag
+                                // 3) otherwise fallback to a preferred global IPv6 (to avoid empty output)
+                                let is_random_suffix = u.SuffixOrigin == IpSuffixOriginRandom;
+                                // SAFETY: field access through documented union layout.
+                                let flags = unsafe { u.Anonymous.Anonymous.Flags };
+                                let is_transient = (flags & IP_ADAPTER_ADDRESS_TRANSIENT) != 0;
+                                let rank = if is_random_suffix || is_transient { 0 } else { 1 };
+                                match best_ipv6 {
+                                    Some((best_rank, _)) if rank >= best_rank => {}
+                                    _ => best_ipv6 = Some((rank, ip)),
+                                }
                             }
                         }
                         _ => {}
                     }
                 }
                 uni = u.Next;
+            }
+            if let Some((_, ip)) = best_ipv6 {
+                out.push(InterfaceIp {
+                    name: friendly.clone(),
+                    ip: IpAddr::V6(ip),
+                });
             }
         }
         adapter = ad.Next;
@@ -328,6 +341,7 @@ fn looks_virtual_windows_interface(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let hints = [
         "virtual",
+        "meta",
         "hyper-v",
         "vmware",
         "virtualbox",
